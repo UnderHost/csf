@@ -1,0 +1,325 @@
+#!/usr/bin/perl
+###############################################################################
+# CSF 2.0 - Core Shield Firewall
+# csf2-ui - standalone web UI service for servers without WHM (CloudPanel,
+# plain Linux). It serves the same firewall UI as the WHM plugin, behind its
+# own login (password + TOTP), on 127.0.0.1 only. Publish it through a reverse
+# proxy with TLS (CloudPanel: a reverse-proxy site), or reach it over an SSH
+# tunnel. It never listens on a public address unless UI_BIND says so.
+#
+# Security model (see CSF2::UIAuth):
+#   - every page except /login needs a valid session cookie
+#   - POST requests must carry the session's CSRF token (injected into forms)
+#   - GET requests may not carry mutating actions
+#   - cookie: HttpOnly, SameSite=Strict, Secure when served over HTTPS
+#   - per-IP login throttling, UI_ALLOW CIDR allowlist, failures logged to
+#     /var/log/csf2-ui.log (LFD watches it and blocks brute force)
+#
+# Copyright (C) 2026 CSF - Core Shield Firewall (GNU GPL v3).
+###############################################################################
+
+use strict;
+use warnings;
+use FindBin qw($Bin);
+use lib "$Bin/../lib", '/usr/local/csf/lib';
+use IO::Socket::INET;
+use IO::Select;
+use POSIX qw(WNOHANG strftime);
+use CSF2::Config;
+use CSF2::IP qw(ip_in_any checkip normalize);
+use CSF2::UIAuth;
+
+my $etc = $ENV{CSF2_ETC} || '/etc/csf';
+my $var = $ENV{CSF2_VAR} || '/var/lib/csf';
+my %cfg = CSF2::Config->loadconfig(file => "$etc/csf.conf")->config;
+
+my $BIND  = $cfg{UI_BIND}  || '127.0.0.1';
+my $PORT  = ($cfg{UI_PORT} && $cfg{UI_PORT} =~ /^\d+$/) ? $cfg{UI_PORT} : 6789;
+# only real IPs/CIDRs count: a leftover legacy value such as "1" must not lock
+# everyone out (or, worse, be misread as a rule)
+my @ALLOW = grep { checkip($_) || CSF2::IP::is_cidr($_) }
+            grep { length } map { s/^\s+|\s+$//gr } split /,/, ($cfg{UI_ALLOW} // '');
+my $TRUST_PROXY = (defined $cfg{UI_TRUST_PROXY} && $cfg{UI_TRUST_PROXY} eq '0') ? 0 : 1;
+my $CGI   = $ENV{CSF2_UI_CGI} || '/usr/local/csf/ui/firewall.cgi';
+my $LOGO  = $ENV{CSF2_UI_LOGO} || '/usr/local/csf/ui/logo.png';
+my $LOG   = $ENV{CSF2_UI_LOG} || '/var/log/csf2-ui.log';
+my $MAX_BODY = 2 * 1024 * 1024;
+
+my $auth = CSF2::UIAuth->new(etc => $etc, var => $var);
+
+my $srv = IO::Socket::INET->new(
+    LocalAddr => $BIND, LocalPort => $PORT, Proto => 'tcp',
+    Listen => 64, ReuseAddr => 1,
+) or die "csf2-ui: cannot listen on $BIND:$PORT: $!\n";
+ulog("started, listening on $BIND:$PORT");
+print "csf2-ui: listening on $BIND:$PORT\n";
+
+$SIG{CHLD} = sub { 1 while waitpid(-1, WNOHANG) > 0 };
+$SIG{PIPE} = 'IGNORE';
+$SIG{TERM} = sub { ulog('stopped'); exit 0 };
+
+my $last_purge = 0;
+while (1) {
+    my $c = $srv->accept or next;
+    if (time - $last_purge > 600) { $auth->purge_sessions; $last_purge = time }
+    my $pid = fork();
+    if (!defined $pid) { close $c; next }
+    if ($pid) { close $c; next }
+    close $srv;
+    $SIG{CHLD} = 'DEFAULT';      # let run_cgi wait for its own child
+    local $SIG{ALRM} = sub { exit 0 };
+    alarm 180;
+    eval { handle($c); 1 } or ulog("error: $@");
+    close $c;
+    exit 0;
+}
+
+###############################################################################
+sub ulog {
+    my ($m) = @_;
+    if (open my $fh, '>>', $LOG) {
+        print {$fh} strftime('%Y-%m-%d %H:%M:%S', localtime) . " csf2-ui: $m\n";
+        close $fh;
+    }
+}
+
+sub handle {
+    my ($c) = @_;
+    binmode $c;
+    my $peer = $c->peerhost // '';
+
+    # --- request line + headers ---
+    my $line = <$c>; return unless defined $line;
+    $line =~ s/\r?\n$//;
+    my ($method, $target) = $line =~ m{^(GET|POST|HEAD) (\S+) HTTP/1\.[01]$} or return respond($c, 400, 'text/plain', "bad request\n");
+    my %h; my $hbytes = 0;
+    while (my $l = <$c>) {
+        $hbytes += length $l;
+        return respond($c, 431, 'text/plain', "headers too large\n") if $hbytes > 65536;
+        $l =~ s/\r?\n$//;
+        last if $l eq '';
+        my ($k, $v) = split /:\s*/, $l, 2;
+        $h{lc $k} = $v if defined $v;
+    }
+    my ($path, $query) = split /\?/, $target, 2;
+    $query //= '';
+
+    # --- client address (behind a local reverse proxy, trust its header) ---
+    my $ip = $peer;
+    my $local = ($peer eq '127.0.0.1' || $peer eq '::1');
+    if ($local && $TRUST_PROXY) {
+        my $fwd = $h{'x-real-ip'} // ((split /\s*,\s*/, ($h{'x-forwarded-for'} // ''))[-1]);
+        $ip = normalize($fwd) if defined $fwd && checkip($fwd);
+    }
+    my $https = (($h{'x-forwarded-proto'} // '') eq 'https') ? 1 : 0;
+
+    if (@ALLOW && !($ip eq '127.0.0.1' || $ip eq '::1') && !ip_in_any($ip, \@ALLOW)) {
+        ulog("denied $ip (not in UI_ALLOW)");
+        return respond($c, 403, 'text/plain', "access denied\n");
+    }
+
+    # --- body ---
+    my $body = '';
+    if ($method eq 'POST') {
+        my $len = $h{'content-length'} // 0;
+        return respond($c, 411, 'text/plain', "length required\n") unless $len =~ /^\d+$/;
+        return respond($c, 413, 'text/plain', "too large\n") if $len > $MAX_BODY;
+        my $got = 0;
+        while ($got < $len) { my $r = read($c, $body, $len - $got, $got); last unless $r; $got += $r }
+    }
+    my %form = parse_qs($method eq 'POST' ? $body : $query);
+
+    my %cookie = map { my ($k, $v) = split /=/, $_, 2; ($k // '') => ($v // '') } split /;\s*/, ($h{cookie} // '');
+    my $token = $cookie{csf2ui};
+    my $sess  = $auth->check_session($token);
+
+    # --- static: logo ---
+    if ($path eq '/assets/logo.png') {
+        open my $fh, '<:raw', $LOGO or return respond($c, 404, 'text/plain', "not found\n");
+        local $/; my $png = <$fh>; close $fh;
+        return respond($c, 200, 'image/png', $png, { 'Cache-Control' => 'max-age=86400' });
+    }
+
+    # --- same-origin check for anything state-changing ---
+    my $same_origin = same_origin(\%h);
+
+    # --- login / logout ---
+    if ($path eq '/login') {
+        if ($method eq 'POST') {
+            return respond($c, 403, 'text/plain', "cross-site request refused\n") unless $same_origin;
+            if ($auth->is_locked($ip)) {
+                ulog("login locked for $ip (too many failures)");
+                return respond($c, 429, 'text/html; charset=utf-8', login_page('Too many failed attempts. Try again in 15 minutes.'));
+            }
+            my ($ok) = $auth->login($form{user}, $form{pass}, $form{code}, $ip);
+            my $u = defined $form{user} ? substr($form{user}, 0, 32) : '';
+            $u =~ s/[^A-Za-z0-9_.-]/?/g;
+            unless ($ok) {
+                ulog("login failed for user $u from $ip");
+                return respond($c, 401, 'text/html; charset=utf-8', login_page('Wrong user name, password or code.'));
+            }
+            my $s = $auth->create_session($form{user}) or return respond($c, 500, 'text/plain', "session error\n");
+            ulog("login ok for user $u from $ip");
+            return redirect($c, '/', set_cookie($s->{token}, $https, 0));
+        }
+        return redirect($c, '/') if $sess;
+        return respond($c, 200, 'text/html; charset=utf-8', login_page(''));
+    }
+    if ($path eq '/logout') {
+        if ($sess && $method eq 'POST' && $same_origin && ct_csrf($sess, $form{_csrf})) {
+            $auth->destroy_session($token);
+            ulog("logout user $sess->{user} from $ip");
+        }
+        return redirect($c, '/login', set_cookie('', $https, 1));
+    }
+
+    # --- everything else needs a session ---
+    return redirect($c, '/login') unless $sess;
+
+    if ($method eq 'POST') {
+        unless ($same_origin && ct_csrf($sess, $form{_csrf})) {
+            ulog("CSRF check failed for user $sess->{user} from $ip");
+            return respond($c, 403, 'text/plain', "request refused (CSRF check)\n");
+        }
+    } elsif (defined $form{action} && $form{action} ne 'update-progress') {
+        return respond($c, 403, 'text/plain', "actions must be submitted with POST\n");
+    }
+
+    # --- run the firewall UI ---
+    my $out = run_cgi($method, $query, $body, $h{'content-type'}, $sess->{user});
+    my ($head, $page) = split /\r?\n\r?\n/, $out, 2;
+    $page //= '';
+    my ($ctype) = ($head // '') =~ /^Content-type:\s*(.+?)\s*$/mi;
+    $ctype ||= 'text/html; charset=utf-8';
+    my ($status) = ($head // '') =~ /^Status:\s*(\d{3})/mi;
+    if ($ctype =~ m{text/html}) { $page = decorate($page, $sess) }
+    return respond($c, $status || 200, $ctype, $page);
+}
+
+sub ct_csrf { my ($sess, $v) = @_; return CSF2::UIAuth::ct_eq($sess->{csrf}, $v // '') }
+
+# same_origin(\%headers) -> 1 if the request came from this site's own pages.
+# Browsers send Sec-Fetch-Site / Origin on POST; Referer is the fallback.
+sub same_origin {
+    my ($h) = @_;
+    my $sfs = $h->{'sec-fetch-site'};
+    return ($sfs eq 'same-origin' || $sfs eq 'none') ? 1 : 0 if defined $sfs;
+    my $host = lc($h->{'x-forwarded-host'} // $h->{host} // '');
+    for my $src ($h->{origin}, $h->{referer}) {
+        next unless defined $src && $src ne 'null';
+        my ($oh) = $src =~ m{^https?://([^/]+)}i;
+        return (defined $oh && lc $oh eq $host) ? 1 : 0;
+    }
+    return 0;
+}
+
+sub run_cgi {
+    my ($method, $query, $body, $ctype, $user) = @_;
+    local %ENV = (
+        PATH => '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        REQUEST_METHOD => $method, QUERY_STRING => $query,
+        CONTENT_LENGTH => length($body), CONTENT_TYPE => ($ctype // 'application/x-www-form-urlencoded'),
+        CSF2_STANDALONE => 1, CSF2_UI_USER => $user,
+        CSF2_ETC => $etc, CSF2_VAR => $var, LANG => 'C.UTF-8',
+        map { defined $ENV{$_} ? ($_ => $ENV{$_}) : () } qw(CSF2_DRYRUN CSF2_NFT),
+    );
+    my ($rd, $wr);
+    pipe($rd, $wr) or return "Content-type: text/plain\r\n\r\npipe failed\n";
+    my $pid = open(my $cgi, '-|');
+    if (!defined $pid) { return "Content-type: text/plain\r\n\r\nfork failed\n" }
+    if (!$pid) {
+        close $wr; open(STDIN, '<&', $rd); open(STDERR, '>', '/dev/null');
+        exec($^X, $CGI) or exit 1;
+    }
+    close $rd; binmode $wr; print {$wr} $body; close $wr;
+    local $/; my $out = <$cgi> // ''; close $cgi;
+    return $out;
+}
+
+# decorate($html, $session) - add the CSRF token to every POST form and a small
+# signed-in bar with Log out.
+sub decorate {
+    my ($html, $s) = @_;
+    my $tok = esc($s->{csrf});
+    $html =~ s{(<form\b[^>]*\bmethod\s*=\s*["']?post["']?[^>]*>)}{$1<input type="hidden" name="_csrf" value="$tok">}gi;
+    my $bar = qq{<div style="display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:6px 16px;background:#1e2433;color:#cfd6e4;font:13px system-ui,sans-serif">}
+            . qq{<span>Signed in as <b style="color:#fff">} . esc($s->{user}) . qq{</b></span>}
+            . qq{<form method="post" action="/logout" style="margin:0"><input type="hidden" name="_csrf" value="$tok">}
+            . qq{<button type="submit" style="background:#3b4458;color:#fff;border:0;border-radius:6px;padding:4px 10px;cursor:pointer">Log out</button></form></div>};
+    $html =~ s{(<body\b[^>]*>)}{$1$bar}i or $html = $bar . $html;
+    return $html;
+}
+
+sub login_page {
+    my ($msg) = @_;
+    my $err = $msg ? '<p style="color:#b42318;background:#fef3f2;border-radius:8px;padding:8px 10px;margin:0 0 12px">' . esc($msg) . '</p>' : '';
+    return <<"HTML";
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CSF Firewall - Sign in</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#eef1f6;font:15px system-ui,-apple-system,Segoe UI,sans-serif;color:#1e2433}
+.card{background:#fff;border-radius:14px;box-shadow:0 8px 30px rgba(20,30,60,.12);padding:28px;width:100%;max-width:340px;margin:16px}
+img{height:42px;display:block;margin:0 0 18px}
+label{display:block;font-size:13px;color:#5b6475;margin:10px 0 4px}
+input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #cfd6e4;border-radius:8px;font-size:15px}
+input:focus{outline:2px solid #4f6bed;border-color:#4f6bed}
+button{width:100%;margin-top:18px;padding:11px;border:0;border-radius:8px;background:#4f6bed;color:#fff;font-size:15px;font-weight:600;cursor:pointer}
+p.hint{font-size:12px;color:#8a93a5;margin:14px 0 0}
+</style></head><body><form class="card" method="post" action="/login" autocomplete="off">
+<img src="/assets/logo.png" alt="CSF - Core Shield Firewall">
+$err
+<label for="u">User name</label><input id="u" name="user" required autofocus>
+<label for="p">Password</label><input id="p" name="pass" type="password" required>
+<label for="c">Authenticator code</label><input id="c" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required>
+<button type="submit">Sign in</button>
+<p class="hint">Users are managed on the server with <code>csf --ui-user</code>.</p>
+</form></body></html>
+HTML
+}
+
+sub set_cookie {
+    my ($val, $secure, $expire) = @_;
+    my $c = "csf2ui=$val; Path=/; HttpOnly; SameSite=Strict";
+    $c .= '; Secure' if $secure;
+    $c .= '; Max-Age=0' if $expire;
+    return { 'Set-Cookie' => $c };
+}
+
+sub redirect {
+    my ($c, $loc, $extra) = @_;
+    return respond($c, 303, 'text/plain', "see $loc\n", { Location => $loc, %{ $extra || {} } });
+}
+
+my %REASON = (200=>'OK',303=>'See Other',400=>'Bad Request',401=>'Unauthorized',403=>'Forbidden',404=>'Not Found',
+              411=>'Length Required',413=>'Payload Too Large',429=>'Too Many Requests',431=>'Request Header Fields Too Large',500=>'Internal Server Error');
+sub respond {
+    my ($c, $code, $type, $body, $extra) = @_;
+    my %hd = (
+        'Content-Type' => $type,
+        'Content-Length' => length($body),
+        'Cache-Control' => 'no-store',
+        'X-Frame-Options' => 'DENY',
+        'X-Content-Type-Options' => 'nosniff',
+        'Referrer-Policy' => 'same-origin',
+        'Content-Security-Policy' => "frame-ancestors 'none'; form-action 'self'; base-uri 'none'",
+        'Connection' => 'close',
+        %{ $extra || {} },
+    );
+    print {$c} "HTTP/1.1 $code " . ($REASON{$code} || 'OK') . "\r\n";
+    print {$c} "$_: $hd{$_}\r\n" for sort keys %hd;
+    print {$c} "\r\n", $body;
+    return;
+}
+
+sub parse_qs {
+    my ($data) = @_;
+    my %p;
+    for my $pair (split /&/, ($data // '')) {
+        my ($k, $v) = split /=/, $pair, 2; next unless defined $k;
+        for ($k, $v) { $_ //= ''; s/\+/ /g; s/%([0-9A-Fa-f]{2})/chr(hex($1))/ge; }
+        $p{$k} = $v;
+    }
+    return %p;
+}
+
+sub esc { my $s = shift // ''; $s =~ s/&/&amp;/g; $s =~ s/</&lt;/g; $s =~ s/>/&gt;/g; $s =~ s/"/&quot;/g; return $s }

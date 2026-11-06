@@ -1,0 +1,18 @@
+[Unit]
+Description=CSF 2.0 - LFD 2.0 (Login Failure Daemon, event-driven detection)
+Documentation=https://shield.underhost.com/firewall
+After=csf.service network.target
+Requires=csf.service
+
+[Service]
+Type=simple
+# LFD 2.0 collectors feed the correlation engine and update nftables sets.
+ExecStart=/usr/local/csf/bin/lfd2
+Restart=on-failure
+RestartSec=5
+# Health of enforcement must survive an LFD crash: the firewall table is owned
+# by csf.service, so a failing LFD never tears down active blocks.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

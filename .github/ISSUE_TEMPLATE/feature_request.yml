@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest an improvement for CSF
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like CSF to do?
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Control panel
+      multiple: true
+      options:
+        - cPanel & WHM
+        - CloudPanel
+        - No control panel

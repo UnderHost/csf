@@ -1,0 +1,779 @@
+#!/usr/bin/perl
+###############################################################################
+# CSF 2.0 - Core Shield Firewall
+# csf2 - command-line interface (CSF-compatible).
+#
+# Preserves familiar CSF flags (-a -d -dr -td -tr -tf -r -l -g -x -e ...) and
+# adds modern long forms (inspect, health, --safe-reload). Every mutating
+# command goes through CSF2::Engine, so single-IP operations touch one nftables
+# set element and never rebuild the ruleset.
+#
+# Environment overrides (for testing / non-standard installs):
+#   CSF2_ETC, CSF2_VAR, CSF2_NFT, CSF2_DRYRUN=1
+#
+# Copyright (C) 2026 CSF - Core Shield Firewall (GNU GPL v3).
+# Next-generation fork of ConfigServer Security & Firewall (C) 2006-2025
+# Jonathan Michaelson.
+###############################################################################
+
+use strict;
+use warnings;
+use FindBin qw($Bin);
+# $Bin/../lib works when run from the source tree; the absolute path works when
+# invoked via the /usr/sbin/csf symlink (FindBin does not resolve symlinks, so
+# $Bin would otherwise be /usr/sbin and miss the installed modules).
+use lib "$Bin/../lib", '/usr/local/csf/lib';
+use CSF2::Config;
+use CSF2::State;
+use CSF2::Nft;
+use CSF2::Engine;
+use CSF2::Health;
+use CSF2::Ruleset;
+use CSF2::Cpanel;
+use CSF2::Migrate;
+use CSF2::Version;
+
+my $VERSION = CSF2::Version::version();   # from the VERSION file
+
+my $etc = $ENV{CSF2_ETC} || '/etc/csf';
+my $var = $ENV{CSF2_VAR} || '/var/lib/csf';
+
+my $config = CSF2::Config->loadconfig(file => "$etc/csf.conf");
+my %cfg    = $config->config;
+my $state  = CSF2::State->new(etc => $etc, var => $var);
+my $nft    = CSF2::Nft->new(
+    dry_run => ($ENV{CSF2_DRYRUN} ? 1 : 0),
+    nft     => ($ENV{CSF2_NFT} || $cfg{NFT} || '/usr/sbin/nft'),
+);
+my $eng = CSF2::Engine->new(config => $config, state => $state, nft => $nft);
+
+my $cmd = shift @ARGV;
+$cmd = '--help' unless defined $cmd;
+
+# remaining args: first token is usually the IP, rest is comment / options
+my $arg  = join(' ', @ARGV);
+my ($ip, $rest) = split(/\s+/, $arg, 2);
+$rest = '' unless defined $rest;
+
+# Parse a timeout token like 3600, 30m, 2h, 1d -> seconds
+sub parse_ttl {
+    my ($t) = @_;
+    return 0 unless defined $t;
+    if ($t =~ /^(\d+)([smhd])$/i) {
+        my ($n, $u) = ($1, lc $2);
+        return $n            if $u eq 's';
+        return $n * 60       if $u eq 'm';
+        return $n * 3600     if $u eq 'h';
+        return $n * 86400    if $u eq 'd';
+    }
+    return $t =~ /^\d+$/ ? $t : 0;
+}
+
+my $rc = 0;
+
+if ($cmd eq '--add' or $cmd eq '-a') {
+    my ($ok, $msg) = $eng->allow($ip, $rest);
+    print "$msg\n"; $rc = $ok ? 0 : 1;
+}
+elsif ($cmd eq '--addrm' or $cmd eq '-ar') {
+    my ($ok, $msg) = $eng->unallow($ip);
+    print "$msg\n"; $rc = $ok ? 0 : 1;
+}
+elsif ($cmd eq '--deny' or $cmd eq '-d') {
+    my ($ok, $msg) = $eng->deny($ip, $rest);
+    print "$msg\n"; $rc = $ok ? 0 : 1;
+}
+elsif ($cmd eq '--denyrm' or $cmd eq '-dr') {
+    my ($ok, $msg) = $eng->undeny($ip);
+    print "$msg\n"; $rc = $ok ? 0 : 1;
+}
+elsif ($cmd eq '--tempdeny' or $cmd eq '-td') {
+    my ($ttl_tok, $comment) = split(/\s+/, $rest, 2);
+    my $ttl = parse_ttl($ttl_tok);
+    if (!$ttl) { $comment = $rest; $ttl = 3600 }   # no ttl given
+    my ($ok, $msg) = $eng->tempdeny($ip, $ttl, comment => ($comment // ''));
+    print "$msg\n"; $rc = $ok ? 0 : 1;
+}
+elsif ($cmd eq '--tempallow' or $cmd eq '-ta') {
+    my ($ttl_tok, $comment) = split(/\s+/, $rest, 2);
+    my $ttl = parse_ttl($ttl_tok) || 3600;
+    my ($ok, $msg) = $eng->tempdeny($ip, $ttl, kind => 'allow', comment => ($comment // ''));
+    print "$msg\n"; $rc = $ok ? 0 : 1;
+}
+elsif ($cmd eq '--temprm' or $cmd eq '-tr') {
+    my ($ok, $msg) = $eng->temprm($ip);
+    print "$msg\n"; $rc = $ok ? 0 : 1;
+}
+elsif ($cmd eq '--tempf' or $cmd eq '-tf') {
+    my ($ok, $msg) = $state->temp_flush();
+    print "$msg\n";
+}
+elsif ($cmd eq '--restart' or $cmd eq '-r' or $cmd eq '--start' or $cmd eq '-s' or $cmd eq '--safe-reload') {
+    my $safe = ($cmd eq '--safe-reload');
+    my %opts;
+    $opts{force} = 1 if grep { $_ eq '--force' } @ARGV;
+
+    # Safe-reload: snapshot the current ruleset first so a watchdog can revert.
+    my $rollback = "$var/csf.rollback";
+    $eng->snapshot_save($rollback) if $safe;
+
+    my $r = $eng->reload(%opts);
+    for my $w (@{ $r->{guard}{warnings} }) { print "*WARNING* $w\n" }
+    if ($r->{ok} && $r->{applied}) {
+        print "csf: firewall ruleset applied atomically (table inet csf)\n";
+        if ($safe) {
+            my $timeout = $cfg{SAFE_RELOAD_TIMEOUT} || 30;
+            unlink "$var/csf.confirmed" if -e "$var/csf.confirmed";
+            spawn_watchdog($eng, $rollback, "$var/csf.confirmed", $timeout) unless $ENV{CSF2_DRYRUN};
+            print "csf: SAFE RELOAD active - run 'csf2 --confirm' within ${timeout}s or the firewall auto-reverts.\n";
+        }
+    } elsif ($r->{ok}) {
+        print "csf: ruleset generated and validated (not applied)\n";
+    } else {
+        print "*ERROR* $r->{error}\n";
+        print "       (re-run with --force to override, or fix the issue above)\n" if @{ $r->{guard}{blocks} };
+        $rc = 1;
+    }
+}
+elsif ($cmd eq '--confirm') {
+    open my $fh, '>', "$var/csf.confirmed" or do { print "*ERROR* cannot write confirm file: $!\n"; exit 1 };
+    print {$fh} time . "\n"; close $fh;
+    print "csf: safe-reload confirmed - the new ruleset will be kept.\n";
+}
+elsif ($cmd eq '--revert') {
+    my ($ok, $msg) = $eng->revert_from("$var/csf.rollback");
+    print "csf: $msg\n"; $rc = $ok ? 0 : 1;
+}
+elsif ($cmd eq '--status' or $cmd eq '-l') {
+    my $deny  = $state->load_list('deny');
+    my $allow = $state->load_list('allow');
+    my $temp  = $state->temp_load();
+    my @live  = grep { !$_->{expired} } @$temp;
+    my $table = $nft->table_exists() ? 'loaded' : 'NOT loaded';
+    print "CSF 2.0 status\n";
+    print "  nftables table inet csf : $table\n";
+    print "  enforcing               : " . ($config->is_enforcing ? 'yes' : 'no (TESTING)') . "\n";
+    print "  allow entries           : " . scalar(@$allow) . "\n";
+    print "  deny entries            : " . scalar(@$deny)  . "\n";
+    print "  temporary entries       : " . scalar(@live)   . "\n";
+}
+elsif ($cmd eq '--grep' or $cmd eq '-g' or $cmd eq 'inspect' or $cmd eq '--inspect') {
+    my $i = $eng->inspect($ip);
+    if ($i->{error}) { print "csf: $i->{error}\n"; $rc = 1 }
+    else {
+        print "IP        : $i->{ip}\n";
+        print "State     : \U$i->{state}\n";
+        print "Found in  : " . (@{$i->{where}} ? join(', ', @{$i->{where}}) : 'nothing') . "\n";
+        print "Comment   : $i->{comment}\n" if $i->{comment};
+    }
+}
+elsif ($cmd eq 'health' or $cmd eq '--health') {
+    my ($results, $worst) = CSF2::Health::check(\%cfg, $nft, $state);
+    print "CSF 2.0 health check\n";
+    my %mark = (ok => '[ OK ]', warn => '[WARN]', fail => '[FAIL]');
+    for my $c (@$results) {
+        printf "  %-6s %-20s %s\n", $mark{$c->{status}}, $c->{name}, $c->{detail};
+    }
+    print "Overall: \U$worst\n";
+    $rc = $worst eq 'fail' ? 2 : ($worst eq 'warn' ? 1 : 0);
+}
+elsif ($cmd eq '--generate' or $cmd eq '--gen') {
+    print CSF2::Ruleset::build(\%cfg, $state->state_for_ruleset());
+}
+elsif ($cmd eq '--cpanel-check') {
+    my $cp = CSF2::Cpanel->new(root => ($ENV{CSF2_ROOT} || ''));
+    my $s = $cp->summary;
+    my $nftver = `$nft->{nft} --version 2>/dev/null`; $nftver =~ s/\s+$//;
+    print "CSF 2.0 cPanel compatibility check\n";
+    printf "  %-22s %s\n", 'cPanel detected', ($s->{cpanel} ? 'yes' : 'NO');
+    printf "  %-22s %s\n", 'cPanel version', ($s->{version} // 'unknown');
+    printf "  %-22s %s\n", 'Firewall backend', ($nft->available ? "nftables ($nftver)" : 'nftables (nft not found)');
+    printf "  %-22s %s\n", 'IPv6', ($cfg{IPV6} ? 'enabled' : 'disabled');
+    printf "  %-22s %s\n", 'cPHulk', ($s->{cphulk} ? 'enabled (respected)' : 'not enabled');
+    printf "  %-22s %s\n", 'ModSecurity', ($s->{modsecurity} ? 'installed' : 'not detected');
+    my ($hres, $worst) = CSF2::Health::check(\%cfg, $nft, $state);
+    my $warn = grep { $_->{status} ne 'ok' } @$hres;
+    printf "  %-22s %s\n", 'Compatibility', ($worst eq 'fail' ? 'FAIL' : 'PASS');
+    printf "  %-22s %d\n", 'Warnings', $warn;
+    $rc = $worst eq 'fail' ? 2 : 0;
+}
+elsif ($cmd eq '--initup') {
+    # boot / systemd start: build + apply (guarded unless forced from unit)
+    my $r = $eng->reload(force => 1);   # boot path trusts on-disk config
+    if ($r->{ok} && $r->{applied}) { print "csf: firewall loaded at boot\n" }
+    elsif ($r->{ok})               { print "csf: firewall generated (dry-run)\n" }
+    else { print "*ERROR* $r->{error}\n"; $rc = 1 }
+}
+elsif ($cmd eq '--initdown' or $cmd eq '--flush') {
+    my ($ok, $out) = $nft->delete_table();
+    print $ok == 0 ? "csf: table inet csf removed\n" : "csf: nothing to remove\n";
+}
+elsif ($cmd eq '--selftest') {
+    # end-to-end functional check: is CSF actually protecting this server?
+    my @r;   # [name, status(PASS/WARN/FAIL), detail]
+    my $nftbin = $nft->{nft};
+
+    my $nftok = $nft->available;
+    push @r, ['nft binary', $nftok ? 'PASS' : 'FAIL', $nftbin];
+
+    my $tbl = $nft->table_exists;
+    push @r, ['kernel table inet csf', $tbl ? 'PASS' : 'FAIL',
+              $tbl ? 'loaded in kernel' : 'NOT loaded - run: csf -r'];
+
+    push @r, ['enforcement', $config->is_enforcing ? 'PASS' : 'WARN',
+              $config->is_enforcing ? 'enforcing (drop policy)' : 'TESTING - not enforcing'];
+
+    # functional block test: add a TEST-NET-3 IP straight to the kernel set,
+    # confirm it landed, then remove it. Does not touch csf.deny.
+    if ($nftok && $tbl && !$ENV{CSF2_DRYRUN}) {
+        my $testip = '203.0.113.222';
+        $nft->add_element('csf_deny4', $testip);
+        my $out = `$nftbin list set inet csf csf_deny4 2>/dev/null`;
+        my $inset = ($out =~ /\Q$testip\E/) ? 1 : 0;
+        $nft->del_element('csf_deny4', $testip);
+        push @r, ['block reaches kernel', $inset ? 'PASS' : 'FAIL',
+                  $inset ? 'a blocked IP lands in the nftables set' : 'test IP not found in set'];
+    }
+
+    # csf.service is a oneshot that loads the ruleset at boot: "inactive" only
+    # means it has not run since the install, which is fine while the table is
+    # loaded. lfd.service is the brute-force detector and must be RUNNING: a
+    # stopped LFD on an enforcing firewall means attackers are never banned.
+    my %svc;
+    for my $s (qw(csf lfd)) {
+        my $st = `systemctl is-active $s 2>/dev/null`; chomp $st;
+        my $en = `systemctl is-enabled $s 2>/dev/null`; chomp $en;
+        $svc{$s} = { active => ($st eq 'active'), state => ($st || 'unknown'), boot => ($en eq 'enabled') };
+    }
+    push @r, ['csf.service',
+              ($svc{csf}{boot} && ($svc{csf}{active} || $tbl)) ? 'PASS' : 'WARN',
+              $svc{csf}{active} ? 'active' . ($svc{csf}{boot} ? ' + loads at boot' : '')
+              : $tbl ? 'ruleset loaded' . ($svc{csf}{boot} ? '; loads at boot' : '; NOT enabled at boot - systemctl enable csf.service')
+              : $svc{csf}{state}];
+    my $enf = $config->is_enforcing;
+    push @r, ['lfd.service',
+              $svc{lfd}{active} ? ($svc{lfd}{boot} ? 'PASS' : 'WARN') : ($enf ? 'FAIL' : 'WARN'),
+              $svc{lfd}{active}
+                ? 'running' . ($svc{lfd}{boot} ? ' + starts at boot' : '; NOT enabled at boot - systemctl enable lfd.service')
+                : "NOT RUNNING ($svc{lfd}{state}) - brute-force attackers are not being banned. Fix: systemctl enable --now lfd.service"];
+
+    # last LFD action, only meaningful while LFD runs (an old log proves nothing)
+    my $log = "$var/lfd.log";
+    if ($svc{lfd}{active}) {
+        my $age = (-e $log && -s $log) ? int((time - (stat $log)[9]) / 86400) : -1;
+        push @r, ['LFD detection', 'PASS',
+                  $age < 0 ? 'running, no attack recorded yet'
+                  : $age == 0 ? 'running, last action today' : "running, last action $age day(s) ago"];
+        # where SSH failures are read from: a syslog auth file or the journal
+        require CSF2::LFD;
+        my ($authf) = grep { -e $_ } ('/var/log/auth.log', '/var/log/secure');
+        my $jrn = CSF2::LFD->journal_wanted(mode => $cfg{LF_JOURNAL} // 'auto');
+        push @r, ['LFD log source', ($authf || $jrn) ? 'PASS' : 'FAIL',
+                  $authf ? $authf . ($jrn ? ' + systemd journal' : '')
+                  : $jrn ? 'systemd journal (no syslog auth file on this server)'
+                  : 'no SSH auth log and LF_JOURNAL=0 - SSH brute force is not detected. Set LF_JOURNAL = "auto"'];
+    }
+
+    if ($nftok && $tbl) {
+        my $chain = `$nftbin list chain inet csf input 2>/dev/null`;
+        my ($pkts) = $chain =~ /counter packets (\d+)/;
+        push @r, ['packets dropped', (defined $pkts ? 'PASS' : 'WARN'),
+                  (defined $pkts ? "$pkts packets dropped by the firewall" : 'no drop counter found')];
+    }
+
+    my $deny = scalar @{ $state->load_list('deny') };
+    my $temp = scalar grep { !$_->{expired} } @{ $state->temp_load() };
+    push @r, ['active blocks', 'PASS', "$deny permanent, $temp temporary"];
+
+    if ($cfg{SCAN_ENABLE}) {
+        require CSF2::Scanner;
+        my $sc = CSF2::Scanner->new(cfg => \%cfg, var => $var);
+        my $e  = $sc->engines;
+        my $last = (stat "$var/scan.last")[9];
+        my $age  = $last ? int((time - $last) / 60) : -1;
+        if ($sc->imunify_present && !$cfg{SCAN_FORCE}) {
+            push @r, ['upload scanning', 'PASS', 'Imunify360 scans uploads (CSF scanner stands by)'];
+        } elsif (!$e->{clamav} && !$e->{yara}) {
+            push @r, ['upload scanning', 'WARN', 'enabled but no engine ready - run: csf --scan-setup'];
+        } else {
+            # just set up: the 5-minute cron has not had its first run yet
+            my $cron = (stat '/etc/cron.d/csf-scan')[9];
+            my $fresh = $age < 0 && $cron && time - $cron < 900;
+            push @r, ['upload scanning', (($age >= 0 && $age <= 15) || $fresh) ? 'PASS' : 'WARN',
+                      ($fresh ? 'enabled, first scan within 5 minutes'
+                       : $age < 0 ? 'never ran - check /etc/cron.d/csf-scan' : "last scan $age min ago")
+                      . ' (' . join(', ', grep { $e->{$_} } qw(clamav yara)) . ')'];
+        }
+    }
+
+    print "CSF 2.0 self-test (v$VERSION)\n";
+    for my $x (@r) { printf "  [%-4s] %-24s %s\n", $x->[1], $x->[0], $x->[2] }
+    my $fails = grep { $_->[1] eq 'FAIL' } @r;
+    my $warns = grep { $_->[1] eq 'WARN' } @r;
+    if ($fails) {
+        print "\nVERDICT: PROBLEM - $fails critical check(s) failed above.\n";
+        $rc = 2;
+    } elsif ($warns) {
+        print "\nVERDICT: CSF IS WORKING (with $warns advisory warning(s)).\n";
+        $rc = 0;
+    } else {
+        print "\nVERDICT: CSF IS WORKING - all checks passed.\n";
+        $rc = 0;
+    }
+}
+elsif ($cmd eq '--self-update') {
+    # Download the latest build from the release channel, verify its sha256,
+    # extract and install it. Progress is written to $var/update.progress so the
+    # WHM UI can render a live progress bar. Safe: aborts on checksum mismatch.
+    my $prog = "$var/update.progress";
+    my $w = sub { my ($pct,$msg) = @_; if (open my $f,'>',$prog){ print {$f} "$pct|$msg\n"; close $f } };
+    my $fail = sub { $w->(-1, "ERROR: $_[0]"); print "*ERROR* $_[0]\n"; exit 1 };
+    my $curl = (-x '/usr/bin/curl') ? '/usr/bin/curl' : 'curl';
+    my $base = $ENV{CSF2_UPDATE_URL} || 'https://shield.underhost.com/firewall/releases/latest.json';
+    # cache-buster so an intermediate CDN (Cloudflare) can't serve a stale manifest
+    my $url  = $base . (($base =~ /\?/) ? '&' : '?') . '_=' . time;
+    $url =~ s/[^A-Za-z0-9:\/._?=&%-]//g;
+
+    $w->(5, 'Checking for updates');
+    my $json = `$curl -fsSL -H 'Cache-Control: no-cache' --max-time 20 "$url" 2>/dev/null` || '';
+    my ($ver) = $json =~ /"version"\s*:\s*"([^"]+)"/;
+    my ($dl)  = $json =~ /"download"\s*:\s*"([^"]+)"/;
+    my ($sum) = $json =~ /"value"\s*:\s*"([a-f0-9]{64})"/;
+    $fail->('could not read the update manifest') unless $ver && $dl;
+
+    # semver compare with installed
+    my @a = ($ver =~ /(\d+)/g); my @b = ($VERSION =~ /(\d+)/g); my $newer = 0;
+    for my $i (0..3) { my $x=$a[$i]//0; my $y=$b[$i]//0; if ($x>$y){$newer=1;last} if ($x<$y){last} }
+    unless ($newer || (grep { $_ eq '--force' } @ARGV)) {
+        $w->(100, "Already up to date (v$VERSION)");
+        print "csf: already up to date (v$VERSION)\n"; exit 0;
+    }
+
+    # Work under $var (/var/lib/csf), NOT /tmp: /tmp is frequently mounted
+    # noexec on hardened cPanel servers, which blocks running the installer.
+    my $tmp = "$var/update.$$"; system('mkdir','-p',$tmp);
+    $w->(20, "Downloading v$ver");
+    system("$curl -fsSL --max-time 180 -o '$tmp/pkg.tgz' \"$dl\"") == 0 or $fail->('download failed');
+    $w->(55, 'Verifying checksum');
+    my $got = `sha256sum '$tmp/pkg.tgz' 2>/dev/null | awk '{print \$1}'`; chomp $got;
+    if ($sum && $got ne $sum) { system("rm -rf '$tmp'"); $fail->('checksum mismatch - update aborted') }
+    $w->(65, 'Extracting package');
+    system("tar xzf '$tmp/pkg.tgz' -C '$tmp'") == 0 or $fail->('extract failed');
+    $fail->('package layout unexpected') unless -f "$tmp/csf2/install.sh";
+    $w->(78, "Installing v$ver");
+    # Invoke via `sh` (script read as input) so it runs even if the extract dir
+    # or /tmp is noexec, and regardless of the file's execute bit.
+    my $rc2 = system("cd '$tmp/csf2' && sh ./install.sh > '$var/update.log' 2>&1");
+    system("rm -rf '$tmp'");
+    if ($rc2 != 0) { $fail->("install failed - see $var/update.log") }
+    unlink "$var/update.json";   # invalidate the WHM update-check cache
+    $w->(100, "Updated to v$ver");
+    print "csf: updated to v$ver\n";
+}
+elsif ($cmd eq '--ti-update') {
+    require CSF2::ThreatIntel;
+    # Single-instance lock: the hourly cron and the WHM button both call this;
+    # if one run is slow (or ever hangs), a second must NOT start and stack up.
+    require Fcntl;
+    open(my $lock, '>', "$var/ti-update.lock") or do { print "*ERROR* cannot open lock\n"; exit 1 };
+    unless (flock($lock, Fcntl::LOCK_EX() | Fcntl::LOCK_NB())) {
+        print "csf: a threat-intel update is already running - skipping\n";
+        exit 0;
+    }
+    print "csf: updating threat-intelligence feeds...\n";
+    unless ($cfg{TI_ENABLE}) { print "*NOTE* Threat Intelligence is disabled (set TI_ENABLE=1). Downloading anyway.\n" }
+    # Hard ceiling so a run can never live forever even if a child ever wedges.
+    my $timeout = ($cfg{TI_UPDATE_TIMEOUT} && $cfg{TI_UPDATE_TIMEOUT} =~ /^\d+$/) ? $cfg{TI_UPDATE_TIMEOUT} : 300;
+    my $rep;
+    eval {
+        local $SIG{ALRM} = sub { die "ti-update timed out after ${timeout}s\n" };
+        alarm($timeout);
+        $rep = CSF2::ThreatIntel::update(nft => $nft, cfg => { %cfg, TI_ENABLE => 1 }, var => $var);
+        alarm(0);
+        1;
+    } or do { alarm(0); print "*ERROR* threat-intel update aborted: $@"; exit 1 };
+    for my $f (@{ $rep->{feeds} }) {
+        printf "  %-6s %-18s %s\n", ($f->{ok} ? 'ok' : 'FAIL'), $f->{id},
+            ($f->{ok} ? "$f->{count} entries" : ($f->{error} || 'error'));
+    }
+    printf "csf: loaded %d indicators into threat-intel sets\n", $rep->{total};
+}
+elsif ($cmd eq '--ti-status') {
+    require CSF2::ThreatIntel;
+    my $st = CSF2::ThreatIntel::status($var);
+    print "CSF 2.0 Threat Intelligence\n";
+    print "  enabled     : " . ($cfg{TI_ENABLE} ? 'yes' : 'no (TI_ENABLE=0)') . "\n";
+    print "  last update : " . ($st->{updated} ? scalar(localtime($st->{updated})) : 'never') . "\n";
+    print "  indicators  : $st->{total}\n";
+    my %cnt = map { $_->{id} => $_ } @{ $st->{feeds} };
+    for my $f (CSF2::ThreatIntel::feeds()) {
+        my $on = CSF2::ThreatIntel::feed_enabled(\%cfg, $f);
+        my $c  = $cnt{$f->{id}} ? $cnt{$f->{id}}{count} : 0;
+        printf "  [%s] %-16s %-13s %s\n", ($on ? 'x' : ' '), $f->{id}, "($f->{category})",
+            ($on ? "$c entries" : 'disabled');
+    }
+}
+elsif ($cmd eq '--scan') {
+    # Malicious upload scanning (CSF2::Scanner). No path: the website files that
+    # changed since the last run (cron every 5 min; no-op unless SCAN_ENABLE=1).
+    # With a path: a full scan of it. --report-only never quarantines or blocks.
+    require CSF2::Scanner;
+    require Fcntl;
+    my @args   = grep { defined && length } ($ip, split /\s+/, $rest);
+    my $report = grep { $_ eq '--report-only' } @args;
+    my ($path) = grep { m{^/} } @args;
+    unless ($path || $cfg{SCAN_ENABLE}) {
+        print "csf: upload scanning is off (SCAN_ENABLE=0). Set it up with: csf --scan-setup\n"; exit 0;
+    }
+    open(my $lock, '>', "$var/scan.lock") or do { print "*ERROR* cannot open lock\n"; exit 1 };
+    unless (flock($lock, Fcntl::LOCK_EX() | Fcntl::LOCK_NB())) { print "csf: a scan is already running - skipping\n"; exit 0 }
+    my %scfg = (%cfg, ($report ? (SCAN_ACTION => 'alert', SCAN_BLOCK_UPLOADER => 0) : ()));
+    my $sc = CSF2::Scanner->new(cfg => \%scfg, var => $var, engine => $eng);
+    my $e  = $sc->engines;
+    print "csf: engines: clamav " . ($e->{clamav} ? 'yes' : 'no') . ", yara " . ($e->{yara} ? 'yes' : 'no') . ", heuristics yes\n";
+    my $rep;
+    if ($path) {
+        local $scfg{SCAN_MAX_FILES} = 10_000_000;
+        my ($files) = $sc->candidates(0, $path);
+        print "csf: scanning " . scalar(@$files) . " file(s) under $path" . ($report ? ' (report only)' : '') . "\n";
+        $rep = $sc->act($sc->scan($files));
+        $sc->alert($rep) unless $report;
+    } else {
+        my $r = $sc->run_incremental;
+        if ($r->{skipped}) { print "csf: scan skipped: $r->{skipped}\n"; exit 0 }
+        print "csf: $r->{files} changed file(s) scanned" . ($r->{truncated} ? ' (limit reached, the rest next run)' : '') . "\n";
+        $rep = $r->{hits};
+    }
+    for my $h (@$rep) {
+        printf "  %-12s %s  [%s %s]%s%s\n", uc $h->{action}, $h->{file}, $h->{engine}, $h->{signature},
+            ($h->{id} ? "  id=$h->{id}" : ''), ($h->{ip} ? "  uploader=$h->{ip}" . ($h->{blocked} ? ' (blocked)' : '') : '');
+    }
+    print "csf: no malicious files found\n" unless @$rep;
+}
+elsif ($cmd eq '--scan-update' or $cmd eq '--scan-setup') {
+    require CSF2::Scanner;
+    my $cron = ($ip // '') eq '--cron';
+    if ($cmd eq '--scan-update' && $cron && !$cfg{SCAN_ENABLE}) { exit 0 }   # daily cron: no-op while scanning is off
+    my $sc = CSF2::Scanner->new(cfg => \%cfg, var => $var, engine => $eng);
+    if ($cmd eq '--scan-setup') {
+        # Engines from the OS repositories: ClamAV (EPEL on EL) and YARA.
+        my $dnf = -x '/usr/bin/dnf' ? '/usr/bin/dnf' : -x '/usr/bin/yum' ? '/usr/bin/yum' : '';
+        my $apt = -x '/usr/bin/apt-get' ? '/usr/bin/apt-get' : '';
+        my @pkgs = ((!$sc->clamscan_bin ? ('clamav') : ()), (!$sc->yara_bin || !-x '/usr/bin/yarac' ? ('yara') : ()));
+        if (@pkgs) {
+            print "csf: installing @pkgs ...\n";
+            # Output goes to a log; a fresh server is often still running its own
+            # updates, so wait for the package lock and retry once after a refresh.
+            my $plog = "$var/scan-pkg.log";
+            my $run = sub { system("$_[0] >>'$plog' 2>&1") == 0 };
+            unlink $plog;
+            my $ok;
+            if ($dnf) {
+                # ClamAV and YARA come from EPEL. CloudLinux and RHEL have no
+                # epel-release package in their own repos: use the official one.
+                unless (system('rpm -q epel-release >/dev/null 2>&1') == 0 || $run->("$dnf -y -q install epel-release")) {
+                    my ($maj) = (`. /etc/os-release 2>/dev/null; echo \$VERSION_ID` =~ /^(\d+)/);
+                    $run->("$dnf -y -q install https://dl.fedoraproject.org/pub/epel/epel-release-latest-$maj.noarch.rpm") if $maj;
+                }
+                # an installed epel-release can still have the repo disabled (CloudLinux)
+                $ok = $run->("$dnf -y -q install @pkgs")
+                   || $run->("$dnf -y -q --enablerepo=epel install @pkgs")
+                   || ($run->("$dnf -y -q makecache") && $run->("$dnf -y -q --enablerepo=epel install @pkgs"));
+            } elsif ($apt) {
+                my $a = "DEBIAN_FRONTEND=noninteractive $apt -o DPkg::Lock::Timeout=600 -y -q";
+                $ok = $run->("$a install @pkgs") || ($run->("$a update") && $run->("$a install @pkgs"));
+            } else { print "*WARN* no dnf/yum/apt-get: install ClamAV and YARA yourself\n"; $ok = 1 }
+            unless ($ok) {
+                print "*WARN* package install failed ($plog):\n";
+                if (open my $pf, '<', $plog) { my @l = <$pf>; close $pf; my $from = @l > 6 ? @l - 6 : 0; print "    $_" for @l[$from .. $#l] }
+            }
+        }
+        print "csf: clamscan: " . ($sc->clamscan_bin // 'NOT installed') . ", yara: " . ($sc->yara_bin // 'NOT installed') . "\n";
+    }
+    print "csf: updating malware signatures ...\n";
+    my $rep;
+    eval {
+        local $SIG{ALRM} = sub { die "signature update timed out\n" };
+        alarm(900);
+        $rep = $sc->update_signatures;
+        alarm(0); 1;
+    } or do { alarm(0); print "*ERROR* $@"; exit 1 };
+    printf "  %-16s %s\n", $_, $rep->{$_} for sort keys %$rep;
+    if ($cmd eq '--scan-setup') {
+        my $e = $sc->engines;
+        unless ($e->{clamav} || $e->{yara}) { print "*ERROR* no scanning engine is ready - fix the errors above and run again\n"; exit 1 }
+        CSF2::Config->save_keys("$etc/csf.conf", { SCAN_ENABLE => '1' });
+        if (-d '/etc/cron.d' && !-e '/etc/cron.d/csf-scan') { write_scan_cron() }
+        print "csf: upload scanning is ON: changed website files are scanned every 5 minutes.\n";
+        # first run now (files changed in the last hour), so it does not wait for cron
+        my $first = eval { $sc->run_incremental } || {};
+        printf "     First scan: %d recently changed file(s), %d found\n", $first->{files} // 0, scalar @{ $first->{hits} || [] }
+            unless $first->{skipped};
+        print "     Roots: " . join(', ', $sc->roots) . "\n";
+        print "     Imunify360 is installed: scans are skipped unless SCAN_FORCE=\"1\"\n" if $sc->imunify_present;
+        print "     Test it now with: csf --scan /path/to/site --report-only\n";
+    }
+}
+elsif ($cmd eq '--scan-status') {
+    require CSF2::Scanner;
+    my $st = CSF2::Scanner->new(cfg => \%cfg, var => $var)->status;
+    my $ago = sub { my $t = shift; return 'never' unless $t; my $m = int((time - $t) / 60); return $m < 120 ? "$m min ago" : int($m / 60) . ' h ago' };
+    print "CSF upload scanning: " . ($st->{enabled} ? 'ON' : 'off (csf --scan-setup)') . "\n";
+    printf "  %-14s %s\n", 'clamav',     $st->{engines}{clamav} ? "ready ($st->{clamscan})" : ($st->{clamscan} ? 'installed, no signatures' : 'not installed');
+    printf "  %-14s %s\n", 'yara',       $st->{engines}{yara} ? "ready ($st->{yara})" : ($st->{yara} ? 'installed, no compiled rules' : 'not installed');
+    printf "  %-14s %s\n", 'signatures', $st->{sigs_at} ? 'updated ' . $ago->($st->{sigs_at}) . ($st->{rfxn_ver} ? ", rfxn $st->{rfxn_ver}" : '') : 'never updated';
+    printf "  %-14s %s\n", 'last scan',  $ago->((stat "$var/scan.last")[9]);
+    printf "  %-14s %d file(s)  (csf --quarantine list)\n", 'quarantine', $st->{quarantine};
+    printf "  %-14s %s\n", 'imunify360', $st->{imunify} ? 'installed - scans skipped unless SCAN_FORCE=1' : 'no';
+    printf "  %-14s %s\n", 'roots', @{ $st->{roots} } ? join(', ', @{ $st->{roots} }) : '(none found)';
+}
+elsif ($cmd eq '--quarantine') {
+    require CSF2::Scanner;
+    my $sc = CSF2::Scanner->new(cfg => \%cfg, var => $var);
+    my ($sub, $id) = ($ip // 'list', (split /\s+/, $rest)[0]);
+    if ($sub eq 'list') {
+        my @q = $sc->quarantine_list;
+        print "csf: quarantine is empty\n" unless @q;
+        for my $q (@q) {
+            my @t = localtime($q->{time} || 0);
+            printf "  %s  %04d-%02d-%02d %02d:%02d  %s  [%s %s]%s\n", $q->{id}, $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1],
+                $q->{path}, $q->{engine}, $q->{signature}, ($q->{ip} ? "  uploader $q->{ip}" : '');
+        }
+    } elsif ($sub eq 'restore' || $sub eq 'delete') {
+        my ($ok, $m) = $sub eq 'restore' ? $sc->quarantine_restore($id) : $sc->quarantine_delete($id);
+        print $ok ? "csf: $m\n" : "*ERROR* $m\n"; $rc = $ok ? 0 : 1;
+    } else { print "usage: csf --quarantine list | restore <id> | delete <id>\n"; $rc = 1 }
+}
+elsif ($cmd eq '--cf-enable' or $cmd eq '--cf-update') {
+    require CSF2::Cloudflare;
+    print "csf: fetching Cloudflare edge IP ranges...\n";
+    if ($cmd eq '--cf-update') { CSF2::Cloudflare::disable(eng => $eng, state => $state) }
+    my ($ok, $msg, $n) = CSF2::Cloudflare::enable(eng => $eng);
+    unless ($ok) { print "*ERROR* $msg\n"; $rc = 1 }
+    else {
+        CSF2::Config->save_keys("$etc/csf.conf", { CF_ENABLE => '1' });
+        print "csf: $msg (allowlisted)\n";
+    }
+}
+elsif ($cmd eq '--cf-disable') {
+    require CSF2::Cloudflare;
+    my ($ok, $msg, $n) = CSF2::Cloudflare::disable(eng => $eng, state => $state);
+    CSF2::Config->save_keys("$etc/csf.conf", { CF_ENABLE => '0' });
+    print "csf: $msg\n";
+}
+elsif ($cmd eq '--cpanel-setup') {
+    # auto-configure ports for this cPanel server (detect SSH + service ports)
+    require CSF2::Cpanel;
+    my $cp = CSF2::Cpanel->new(root => ($ENV{CSF2_ROOT} || ''));
+    my ($live_ssh) = ($ENV{SSH_CONNECTION} || '') =~ /(\d+)\s*$/;   # server-side SSH port
+    my $rec = $cp->recommended_config(extra_ssh => ($live_ssh || ()));
+    unless ($rec && $rec->{TCP_IN}) { print "*ERROR* could not build cPanel port set\n"; exit 1 }
+    my %kv = (TCP_IN => $rec->{TCP_IN}, UDP_IN => $rec->{UDP_IN}, MGMT_PORTS => $rec->{MGMT_PORTS});
+    my ($ok, $m) = CSF2::Config->save_keys("$etc/csf.conf", \%kv);
+    if ($ok) {
+        print "csf: cPanel ports configured for this server\n";
+        print "     SSH port(s) kept open : " . join(',', @{ $rec->{ssh_ports} }) . "\n";
+        print "     TCP_IN                : $rec->{TCP_IN}\n";
+        print "     MGMT_PORTS            : $rec->{MGMT_PORTS}\n";
+        print "     (run 'csf -r' to apply)\n";
+    } else { print "*ERROR* $m\n"; $rc = 1 }
+}
+elsif ($cmd eq '--platform') {
+    require CSF2::Platform;
+    my $pl = CSF2::Platform->new(root => ($ENV{CSF2_ROOT} || ''));
+    my $p = $pl->detect;
+    print "csf: platform: " . $pl->label($p) . " ($p)\n";
+}
+elsif ($cmd eq '--platform-setup') {
+    # auto-configure ports for a non-cPanel server (CloudPanel / plain Linux)
+    require CSF2::Platform;
+    my $pl = CSF2::Platform->new(root => ($ENV{CSF2_ROOT} || ''));
+    my ($live_ssh) = ($ENV{SSH_CONNECTION} || '') =~ /(\d+)\s*$/;
+    my $want = $ip;   # optional: cloudpanel | generic
+    my $rec = $pl->recommended_config(($want ? (platform => $want) : ()), extra_ssh => ($live_ssh || ()));
+    my %kv = (TCP_IN => $rec->{TCP_IN}, UDP_IN => $rec->{UDP_IN}, MGMT_PORTS => $rec->{MGMT_PORTS});
+    my ($ok, $m) = CSF2::Config->save_keys("$etc/csf.conf", \%kv);
+    if ($ok) {
+        print "csf: " . $pl->label($rec->{platform}) . " ports configured for this server\n";
+        print "     SSH port(s) kept open : " . join(',', @{ $rec->{ssh_ports} }) . "\n";
+        print "     TCP_IN                : $rec->{TCP_IN}\n";
+        print "     UDP_IN                : $rec->{UDP_IN}\n";
+        print "     MGMT_PORTS            : $rec->{MGMT_PORTS}\n";
+        print "     (run 'csf -r' to apply)\n";
+    } else { print "*ERROR* $m\n"; $rc = 1 }
+}
+elsif ($cmd eq '--ui-user') {
+    # standalone web UI accounts (servers without WHM)
+    require CSF2::UIAuth;
+    my $auth = CSF2::UIAuth->new(etc => $etc, var => $var);
+    my ($sub, $name) = ($ip // '', (split /\s+/, $rest)[0]);
+    if ($sub eq 'list') {
+        my $u = $auth->load_users;
+        print "csf: UI users: " . (%$u ? join(', ', sort keys %$u) : '(none)') . "\n";
+    } elsif ($sub eq 'del' && $name) {
+        my ($ok, $m) = $auth->del_user($name);
+        print $ok ? "csf: user $name removed (sessions revoked)\n" : "*ERROR* $m\n"; $rc = $ok ? 0 : 1;
+    } elsif (($sub eq 'add' || $sub eq 'passwd') && $name) {
+        my $pw = $ENV{CSF2_UI_PASSWORD};
+        unless (defined $pw) {
+            $pw = read_secret("Password for $name (min 12 chars): ");
+            my $again = read_secret('Repeat password: ');
+            if (!defined $pw || !defined $again || $pw ne $again) { print "*ERROR* passwords do not match\n"; exit 1 }
+        }
+        my ($ok, $m, $secret) = $auth->set_user($name, $pw);
+        if ($ok) {
+            $auth->revoke_user_sessions($name);
+            chomp(my $host = `hostname -f 2>/dev/null` || 'server');
+            print "csf: $m\n\n";
+            print "  Add this account to your authenticator app (Google Authenticator,\n";
+            print "  1Password, Authy...). The code is required at every login.\n\n";
+            print "  Secret : $secret\n";
+            print "  URI    : " . $auth->otpauth_uri($name, $secret, $host) . "\n\n";
+            print "  Keep the secret private; anyone with it can generate login codes.\n";
+        } else { print "*ERROR* $m\n"; $rc = 1 }
+    } else {
+        print "usage: csf --ui-user add|passwd|del <name>   |   csf --ui-user list\n"; $rc = 1;
+    }
+}
+elsif ($cmd eq 'migrate' or $cmd eq '--migrate') {
+    my $dry = grep { $_ eq '--dry-run' } @ARGV;
+    my $legacy = $ENV{CSF2_LEGACY_ETC} || $etc;
+    my $mig = CSF2::Migrate->new(legacy_etc => $legacy, target_etc => $etc);
+    my ($newcfg, $rep) = $mig->analyze;
+    print "CSF 2.0 migration " . ($dry ? "(dry run)\n" : "from legacy CSF\n");
+    printf "  Migrated:      %d settings\n", $rep->{count_migrated};
+    printf "  Converted:     %d settings\n", $rep->{count_converted};
+    printf "  Deprecated:    %d settings\n", $rep->{count_deprecated};
+    printf "  Manual review: %d settings\n", $rep->{count_manual};
+    printf "  Errors:        %d\n", $rep->{count_errors};
+    # deprecated list is short + important - show it inline
+    for my $d (@{ $rep->{deprecated} }) { print "    [deprecated] $d\n" }
+    # the manual-review list can be large (legacy LF_* tuning); write the full
+    # report to a file and print only a pointer to keep the console readable.
+    my $report = "$etc/migration-report.txt";
+    if (!$dry && open(my $rf, '>', $report)) {
+        print {$rf} "CSF 2.0 migration report - " . localtime() . "\n\n";
+        for my $sec (qw(migrated converted deprecated manual errors)) {
+            print {$rf} "== \U$sec\E (" . scalar(@{$rep->{$sec}}) . ") ==\n";
+            print {$rf} "  $_\n" for @{ $rep->{$sec} };
+            print {$rf} "\n";
+        }
+        close $rf;
+    }
+    if ($rep->{count_manual}) {
+        printf "  -> %d settings flagged for review under CSF 2.0 risk scoring; full report: %s\n",
+            $rep->{count_manual}, ($dry ? '(dry run - not written)' : $report);
+    }
+    unless ($dry) {
+        my ($bok, $bpath) = $mig->backup;
+        print "  Backup:        $bpath" . ($bok ? "\n" : " (WARNING: incomplete)\n");
+        my $counts = $mig->import_lists;
+        printf "  Lists:         allow=%d deny=%d ignore=%d\n",
+            ($counts->{allow}//0), ($counts->{deny}//0), ($counts->{ignore}//0);
+        my ($wok, $wpath) = $mig->write_config($newcfg);
+        print "  Config:        " . ($wok ? "$wpath\n" : "FAILED\n");
+        print "  Next: review $etc/csf.conf, then 'csf2 health' and 'csf2 --safe-reload'\n";
+    }
+}
+elsif ($cmd eq '--version' or $cmd eq '-v') {
+    print "csf: v$VERSION (Core Shield Firewall)\n";
+}
+elsif ($cmd eq '--help' or $cmd eq '-h') {
+    print_help();
+}
+else {
+    print "csf: unknown command '$cmd'\n\n";
+    print_help();
+    $rc = 1;
+}
+
+exit $rc;
+
+###############################################################################
+# spawn_watchdog: detached child that auto-reverts the firewall unless the
+# admin confirms in time. This is what makes --safe-reload safe on a remote box:
+# if the reload cut off the admin, they simply never run --confirm and the
+# previous working ruleset is restored automatically.
+# Scanning cron: every 5 minutes, signatures daily. Both are no-ops while SCAN_ENABLE=0.
+sub write_scan_cron {
+    open my $c, '>', '/etc/cron.d/csf-scan' or return;
+    print {$c} "# CSF 2.3 - malicious upload scanning (no-op unless SCAN_ENABLE=1)\n",
+               "*/5 * * * * root /usr/local/csf/bin/csf2 --scan >/dev/null 2>&1\n",
+               "41 4 * * * root /usr/local/csf/bin/csf2 --scan-update --cron >/dev/null 2>&1\n";
+    close $c;
+    chmod 0644, '/etc/cron.d/csf-scan';
+}
+
+sub spawn_watchdog {
+    my ($eng, $rollback, $confirm, $timeout) = @_;
+    my $pid = fork();
+    return unless defined $pid;   # fork failed - caller already applied ruleset
+    return if $pid;               # parent continues
+
+    # child: detach from the controlling terminal and wait out the window.
+    eval { require POSIX; POSIX::setsid(); };
+    open(STDIN,  '<', '/dev/null');
+    open(STDOUT, '>', '/dev/null');
+    open(STDERR, '>', '/dev/null');
+    sleep $timeout;
+    unless (-e $confirm) {
+        $eng->revert_from($rollback);
+    }
+    exit 0;
+}
+
+# read_secret($prompt) -> line from the terminal without echo
+sub read_secret {
+    my ($prompt) = @_;
+    print $prompt;
+    my $tty = -t STDIN;
+    system('stty', '-echo') if $tty;
+    my $l = <STDIN>;
+    system('stty', 'echo') if $tty;
+    print "\n" if $tty;
+    chomp $l if defined $l;
+    return $l;
+}
+
+sub print_help {
+    print <<"HELP";
+CSF 2.0 - Core Shield Firewall - v$VERSION
+
+Usage: csf [option] [value]
+
+  -a,  --add    ip [comment]     Allow an IP/CIDR and add to the allow list
+  -ar, --addrm  ip               Remove an IP/CIDR from the allow list
+  -d,  --deny   ip [comment]     Block an IP/CIDR and add to the deny list
+  -dr, --denyrm ip               Unblock an IP/CIDR from the deny list
+  -td, --tempdeny  ip [ttl] [c]  Temporarily block (ttl e.g. 3600, 30m, 2h, 1d)
+  -ta, --tempallow ip [ttl]      Temporarily allow
+  -tr, --temprm ip               Remove a temporary entry
+  -tf, --tempf                   Flush all temporary entries
+  -r,  --restart                 Rebuild + apply the firewall (atomic, guarded)
+       --safe-reload             Reload with lockout protection (same as -r)
+       --force                   Override lockout guard on reload (dangerous)
+  -l,  --status                  Show firewall status summary
+  -g,  --grep ip / inspect ip    Inspect the state of an IP
+  -v,  --version                 Show version
+  -h,  --help                    This help
+       --selftest               Verify CSF is actually protecting the server
+       --ti-update               Refresh Threat Intelligence feeds
+       --ti-status               Show Threat Intelligence feed status
+       --scan [path] [--report-only]  Scan changed website files (or a path) for malware
+       --scan-setup              Install ClamAV + YARA, download signatures, turn scanning on
+       --scan-update             Refresh rfxn + YARA-Forge signatures
+       --scan-status             Engines, signatures, last scan, quarantine
+       --quarantine list|restore <id>|delete <id>  Manage quarantined files
+       --cf-enable / --cf-update Allowlist all Cloudflare edge IP ranges
+       --cf-disable              Remove Cloudflare ranges from the allow list
+       --self-update [--force]   Download + install the latest release from
+                                 shield.underhost.com (SHA-256 verified)
+       --platform                Show the detected hosting platform
+       --platform-setup [name]   Auto-configure ports (CloudPanel / generic)
+       --ui-user add|passwd|del <name>, --ui-user list
+                                 Standalone web UI logins (password + 2FA)
+
+Single-IP operations update one nftables set element and never rebuild the
+ruleset. Temporary blocks use native nftables set timeouts.
+HELP
+}

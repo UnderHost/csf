@@ -1,0 +1,102 @@
+#!/usr/bin/perl
+###############################################################################
+# CSF 2.0 - Core Shield Firewall
+# lfd2 - Login Failure Daemon 2.0 entrypoint.
+#
+# Wires the detection pipeline (Detect -> Risk -> Engine) and tails the
+# configured log files, updating nftables sets in near-real-time.
+#
+# Environment overrides (testing): CSF2_ETC, CSF2_VAR, CSF2_NFT, CSF2_DRYRUN,
+#   CSF2_MAX_TICKS (bounded run).
+#
+# Copyright (C) 2026 CSF - Core Shield Firewall (GNU GPL v3).
+###############################################################################
+
+use strict;
+use warnings;
+use FindBin qw($Bin);
+# absolute path covers invocation via symlink (FindBin does not follow symlinks)
+use lib "$Bin/../lib", '/usr/local/csf/lib';
+use CSF2::Config;
+use CSF2::State;
+use CSF2::Nft;
+use CSF2::Engine;
+use CSF2::Detect;
+use CSF2::Risk;
+use CSF2::LFD;
+
+my $etc = $ENV{CSF2_ETC} || '/etc/csf';
+my $var = $ENV{CSF2_VAR} || '/var/lib/csf';
+
+my $config = CSF2::Config->loadconfig(file => "$etc/csf.conf");
+my %cfg    = $config->config;
+my $state  = CSF2::State->new(etc => $etc, var => $var);
+my $nft    = CSF2::Nft->new(
+    dry_run => ($ENV{CSF2_DRYRUN} ? 1 : 0),
+    nft     => ($ENV{CSF2_NFT} || $cfg{NFT} || '/usr/sbin/nft'),
+);
+my $eng = CSF2::Engine->new(config => $config, state => $state, nft => $nft);
+
+# --- log files to watch ---
+my @logfiles = read_list("$etc/csf.logfiles");
+unless (@logfiles) {
+    # sensible cPanel defaults if no list configured
+    @logfiles = grep { -e $_ } (
+        '/var/log/secure', '/var/log/messages', '/var/log/maillog',
+        '/var/log/exim_mainlog', '/usr/local/cpanel/logs/login_log',
+        '/var/log/auth.log',
+    );
+}
+
+# --- never-block lists ---
+my @ignore     = map { $_->{tok} } parse_ip_list("$etc/csf.ignore");
+my @server_ips = local_ips();
+
+my $risk = CSF2::Risk->new(
+    map { $_ => $cfg{$_} } grep { exists $cfg{$_} }
+        qw(HALFLIFE T_MONITOR T_THROTTLE T_SHORT_BLOCK T_LONG_BLOCK T_PERM OFFENSE_TTL PERM_AFTER)
+);
+
+my $lfd = CSF2::LFD->new(
+    engine => $eng, state => $state, risk => $risk,
+    detect => CSF2::Detect->new, var => $var,
+    ignore => \@ignore, server_ips => \@server_ips,
+    logfiles => \@logfiles,
+    interval => ($cfg{LF_PARSE} && $cfg{LF_PARSE} =~ /^\d+$/ ? $cfg{LF_PARSE} : 5),
+    journal  => CSF2::LFD->journal_wanted(mode => $cfg{LF_JOURNAL} // 'auto'),
+);
+
+$0 = 'lfd2 - Core Shield Firewall';
+$| = 1;   # journald gets the start-up lines immediately, not at exit
+print "lfd2: watching " . scalar(@logfiles) . " log file(s)" . ($lfd->{journal} ? ' + systemd journal' : '')
+    . "; interval $lfd->{interval}s\n";
+print "lfd2: ignore=" . scalar(@ignore) . " server_ips=" . scalar(@server_ips) . "\n";
+
+$lfd->run(max_ticks => ($ENV{CSF2_MAX_TICKS} || undef));
+
+###############################################################################
+sub read_list {
+    my ($file) = @_;
+    return () unless -e $file;
+    open my $fh, '<', $file or return ();
+    my @l;
+    while (<$fh>) { chomp; s/^\s+|\s+$//g; next if /^#/ || /^$/; push @l, $_ }
+    close $fh;
+    return @l;
+}
+
+sub parse_ip_list {
+    my ($file) = @_;
+    return map { { tok => $_ } } grep { /\S/ } map { (split /\s*#/, $_)[0] } read_list($file);
+}
+
+# local_ips() - this host's own addresses via `ip -o addr` (best effort).
+sub local_ips {
+    my @ips;
+    my $ipbin = (-x '/usr/sbin/ip') ? '/usr/sbin/ip' : (-x '/sbin/ip' ? '/sbin/ip' : 'ip');
+    my @out = eval { `$ipbin -o addr show 2>/dev/null` };
+    for my $line (@out) {
+        if ($line =~ m{inet6?\s+([0-9a-fA-F:.]+)/}) { push @ips, $1 }
+    }
+    return @ips;
+}

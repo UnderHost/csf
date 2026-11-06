@@ -1,0 +1,25 @@
+[Unit]
+Description=CSF 2.0 - Core Shield Firewall (nftables ruleset)
+Documentation=https://shield.underhost.com/firewall
+# Load before any network interface comes up (like the distro nftables.service).
+# Never add "After=network-pre.target": with "Before=" it is an ordering cycle
+# and systemd silently drops this job at boot, leaving the server unprotected.
+DefaultDependencies=no
+After=local-fs.target systemd-sysctl.service
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Load the CSF nftables ruleset atomically from on-disk config + state.
+ExecStart=/usr/local/csf/bin/csf2 --initup
+# Rebuild on reload (atomic, lockout-guarded).
+ExecReload=/usr/local/csf/bin/csf2 --restart
+# On stop, remove the CSF table so no stale rules linger in the kernel.
+ExecStop=/usr/local/csf/bin/csf2 --initdown
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

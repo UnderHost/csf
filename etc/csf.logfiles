@@ -1,0 +1,15 @@
+# CSF 2.0 - log files watched by LFD 2.0 (one path per line).
+# The service is inferred from the log content by the detection rules, so this
+# is just the list of files to tail. Missing files are skipped safely.
+# cPanel / RHEL-family defaults:
+/var/log/secure
+/var/log/messages
+/var/log/maillog
+/var/log/exim_mainlog
+/usr/local/cpanel/logs/login_log
+/usr/local/cpanel/logs/access_log
+# Debian/Ubuntu:
+/var/log/auth.log
+/var/log/mail.log
+# CSF standalone web UI login log (csf2-ui):
+/var/log/csf2-ui.log

@@ -1,0 +1,20 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: |
+          for f in bin/csf2 bin/lfd2 ui/csf2-ui cpanel/csf2.cgi; do perl -Ilib -c "$f"; done
+          for f in install.sh uninstall.sh run-tests.sh scripts/*.sh; do sh -n "$f"; done
+      - name: Test suite
+        run: sh run-tests.sh

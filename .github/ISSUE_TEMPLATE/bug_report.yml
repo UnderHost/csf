@@ -1,0 +1,52 @@
+name: Bug report
+description: Something does not work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Security problems:** please e-mail support@underhost.com instead (see SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: CSF version
+      description: Output of `csf -v`
+      placeholder: "2.3.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Control panel
+      options:
+        - cPanel & WHM
+        - CloudPanel
+        - No control panel
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "AlmaLinux 9.6, Ubuntu 24.04, Debian 13..."
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: selftest
+    attributes:
+      label: Output of `csf --selftest`
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: From /var/lib/csf/lfd.log, /var/log/csf2-ui.log or the installer. Remove IP addresses you do not want to share.
+      render: text

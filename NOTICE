@@ -1,0 +1,30 @@
+CSF - Core Shield Firewall
+Copyright (C) 2026 UnderHost (https://underhost.com)
+
+CSF - Core Shield Firewall (formerly "cPanel Shield Firewall") is a
+next-generation fork of ConfigServer Security & Firewall (CSF), originally
+written by Way to the Web Ltd. (ConfigServer) and distributed under the
+GNU General Public License version 3. The CSF name, the csf.conf / csf.allow /
+csf.deny / csf.ignore file model and the Login Failure Daemon (LFD) concept
+come from that project. CSF 2.x is a rewrite on native nftables.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See the LICENSE file for the full text.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE.
+
+Third-party data used at run time (downloaded by the server, not included in
+this repository):
+  - Spamhaus DROP / EDROP, abuse.ch Feodo Tracker, CINS Army, IPsum and
+    Blocklist.de reputation feeds (Threat Intelligence; each under its own terms)
+  - R-fx Networks Linux Malware Detect (rfxn) signatures, GPL-2.0
+  - YARA-Forge rule packages, under the licenses of their individual rules
+  - ClamAV and YARA are installed from the operating system's repositories
+
+Trademarks: cPanel and WHM are registered trademarks of cPanel, L.L.C.
+CloudPanel is a trademark of its owner. UnderHost, UnderShield and CSF are not
+affiliated with or endorsed by cPanel, L.L.C. or ConfigServer.

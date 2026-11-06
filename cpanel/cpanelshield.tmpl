@@ -1,0 +1,21 @@
+[%
+USE Whostmgr;
+WRAPPER 'master_templates/master.tmpl'
+    header = 'Core Shield Firewall'
+    skipsupport = 1
+    skipheader = 1
+    hide_license_warnings = 1
+    theme = 'bootstrap'
+    breadcrumbdata = {
+        previous = [
+            { name = "Home",    url = "/scripts/command?PFILE=main" },
+            { name = "Plugins", url = "/scripts/command?PFILE=Plugins" }
+        ],
+        name = 'Core Shield Firewall',
+        url  = '/cgi/cpanelshield/firewall.cgi',
+    };
+%]
+
+[% cpanelshield_output %]
+
+[% END %]

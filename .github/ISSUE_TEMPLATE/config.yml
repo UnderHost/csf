@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://shield.underhost.com/firewall/docs/
+    about: Installation, configuration, CLI reference and troubleshooting.
+  - name: Security report
+    url: https://shield.underhost.com/firewall/docs/
+    about: Please e-mail support@underhost.com with the subject "CSF security report" - never a public issue.

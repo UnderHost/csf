@@ -1,0 +1,19 @@
+[Unit]
+Description=CSF 2.0 - standalone firewall web UI (servers without WHM)
+Documentation=https://shield.underhost.com/firewall
+After=network.target csf.service
+
+[Service]
+Type=simple
+# Listens on UI_BIND:UI_PORT (default 127.0.0.1:6789) - publish it through a
+# TLS reverse proxy (CloudPanel reverse-proxy site) or an SSH tunnel.
+ExecStart=/usr/local/csf/bin/csf2-ui
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+# No ProtectSystem/ProtectHome: the UI's Update button runs the installer
+# (writes /etc, /usr/sbin) and platform detection looks under /home (CloudPanel).
+
+[Install]
+WantedBy=multi-user.target

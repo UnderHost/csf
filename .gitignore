@@ -1,0 +1,9 @@
+# build output and local test leftovers
+*.tar.gz
+*.tar.gz.sha256
+*.bak
+*.orig
+*.swp
+.DS_Store
+Thumbs.db
+/tmp/

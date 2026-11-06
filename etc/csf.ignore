@@ -1,0 +1,6 @@
+# CSF 2.0 - LFD ignore list. IPs/CIDRs here are never blocked by LFD detection
+# (monitoring servers, backup servers, your own management network, etc.).
+# One IP or CIDR per line; "# comment" allowed. The allow list (csf.allow) and
+# the server's own addresses are also never blocked.
+127.0.0.1
+::1
