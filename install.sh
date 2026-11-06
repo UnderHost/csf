@@ -262,6 +262,38 @@ if [ "$PLATFORM" != "cpanel" ]; then
             warn "clpctl could not create the site - create it in CloudPanel: Add Site > Reverse Proxy > http://127.0.0.1:$_uiport"
         fi
     fi
+    # Proxy key: csf2-ui believes a proxy's visitor address (X-Real-IP) only when
+    # the proxy also sends this secret - other local processes cannot read it,
+    # so they cannot fake addresses to dodge the sign-in lockout.
+    if [ ! -s "$ETC/ui.proxykey" ]; then
+        ( umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ETC/ui.proxykey" )
+    fi
+    chmod 600 "$ETC/ui.proxykey"
+    # add it to every nginx site that proxies to the UI (CloudPanel or your own);
+    # nginx -t must pass, otherwise the change is undone
+    _uiport=$(sed -n 's/^UI_PORT *= *"\{0,1\}\([0-9]*\)"\{0,1\}.*/\1/p' "$ETC/csf.conf" | head -1); _uiport=${_uiport:-6789}
+    if command -v nginx >/dev/null 2>&1; then
+        _key=$(cat "$ETC/ui.proxykey"); _patched=""
+        for _f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+            [ -f "$_f" ] || continue
+            grep -q "proxy_pass http://127.0.0.1:$_uiport" "$_f" || continue
+            grep -q "X-CSF-Proxy-Key $_key;" "$_f" && continue
+            _real=$(readlink -f "$_f")
+            cp -p "$_real" "$_real.csf-bak"
+            sed -i "/X-CSF-Proxy-Key/d; s#\(proxy_pass http://127.0.0.1:$_uiport;\)#\1\n        proxy_set_header X-CSF-Proxy-Key $_key;#" "$_real"
+            _patched="$_patched $_real"
+        done
+        if [ -n "$_patched" ]; then
+            if nginx -t >/dev/null 2>&1; then
+                systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1 || true
+                for _r in $_patched; do rm -f "$_r.csf-bak"; done
+                ok "nginx sites proxying to the UI now send the proxy key"
+            else
+                for _r in $_patched; do mv -f "$_r.csf-bak" "$_r"; done
+                warn "could not add the proxy key to nginx (nginx -t failed) - see the CSF docs (UI behind a reverse proxy)"
+            fi
+        fi
+    fi
 fi
 
 # 5b) Threat Intelligence: install an hourly feed-refresh cron. It is a no-op

@@ -25,6 +25,9 @@ use warnings;
 use File::Find ();
 use File::Copy ();
 use File::Path ();
+use File::Basename ();
+use Fcntl qw(O_RDONLY O_WRONLY O_CREAT O_EXCL O_NOFOLLOW);
+use POSIX ();
 use Time::Local ();
 use CSF2::Platform;
 
@@ -146,10 +149,14 @@ sub candidates {
     my @excl  = map { $s->_p($_) } grep { m{^/} } split /\s*,\s*/, $s->cfg('SCAN_EXCLUDE', '');
     my $q     = $s->qdir;
     my @found;                                   # [changed, path]
+    my @odd;                                     # names with control characters
     File::Find::find({
         no_chdir => 1,
         wanted   => sub {
             my $f = $File::Find::name;
+            # a line break would split the engines' file list: never scan such a
+            # name, report it (nothing legitimate needs one)
+            if ($f =~ /[\x00-\x1f\x7f]/) { push @odd, $f; return }
             if (-d $f) {
                 if (-l $f || $f eq $q || grep { $f eq $_ || index($f, "$_/") == 0 } @excl) { $File::Find::prune = 1 }
                 elsif ($f =~ m{/(?:\.git|node_modules)$}) { $File::Find::prune = 1 }
@@ -167,6 +174,7 @@ sub candidates {
             push @found, [$changed, $f];
         },
     }, grep { -d $_ } @paths);
+    for my $o (@odd) { (my $show = $o) =~ s/[\x00-\x1f\x7f]/?/g; $s->_log("SUSPICIOUS file name with control characters, not scanned: $show") }
     # Oldest change first: when the per-run limit cuts the list, the next run
     # continues from the last file scanned (third return value) - nothing is skipped.
     @found = sort { $a->[0] <=> $b->[0] || $a->[1] cmp $b->[1] } @found;
@@ -212,8 +220,10 @@ sub scan {
     my ($s, $files) = @_;
     return [] unless @$files;
     my %hit;
+    my %listed = map { $_ => 1 } @$files;
     my $keep = sub {
         my ($h) = @_;
+        return unless $listed{ $h->{file} };     # only files we asked about
         my $cur = $hit{ $h->{file} };
         $hit{ $h->{file} } = $h if !$cur || ($h->{certain} && !$cur->{certain});
     };
@@ -274,13 +284,26 @@ sub heuristic {
 sub quarantine {
     my ($s, $hit) = @_;
     my $f = $hit->{file};
-    my @st = lstat $f or return (0, "cannot stat $f");
+    # The site owner controls this path: never follow a symlink swapped in after
+    # the scan, copy from the opened file, and remove the path only if it is
+    # still that same file.
+    sysopen(my $in, $f, O_RDONLY | O_NOFOLLOW) or return (0, "cannot open $f safely: $!");
+    my @st = stat $in;
+    return (0, "$f is not a regular file") unless @st && -f _;
     my $id = sprintf('%d-%04x', $s->{now}->(), int(rand(0xffff)));
     my $d  = $s->qdir . "/$id";
     File::Path::make_path($d, { mode => 0700 });
     chmod 0700, $s->qdir;
-    File::Copy::copy($f, "$d/file") or return (0, "copy failed: $!");
+    open(my $out, '>', "$d/file") or return (0, "copy failed: $!");
+    binmode $in; binmode $out;
+    File::Copy::copy($in, $out) or return (0, "copy failed: $!");
+    close $out; close $in;
     return (0, 'copy size mismatch') unless -s "$d/file" == $st[7];
+    my @now = lstat $f;
+    unless (@now && -f _ && $now[0] == $st[0] && $now[1] == $st[1]) {
+        File::Path::remove_tree($d);
+        return (0, "$f changed while it was being quarantined - left in place");
+    }
     unlink $f or do { unlink "$d/file"; return (0, "cannot remove $f: $!") };
     chmod 0000, "$d/file";
     if (open my $m, '>', "$d/meta") {
@@ -307,14 +330,65 @@ sub quarantine_restore {
     return (0, 'invalid id') unless defined $id && $id =~ /^\d+-[0-9a-f]{4}$/;
     my $d = $s->qdir . "/$id";
     my %m = _read_meta("$d/meta") or return (0, "no quarantine entry $id");
-    return (0, "$m{path} exists again - not overwriting it") if -e $m{path};
+    my $path = $m{path} // '';
+    my ($uid, $gid) = map { defined $_ && /^\d+$/ ? $_ : -1 } @m{qw(uid gid)};
+    return (0, 'invalid quarantine entry') unless $path =~ m{^/} && $path !~ /[\x00-\x1f\x7f]/ && $uid >= 0 && $gid >= 0;
+    return (0, "$path exists again - not overwriting it") if -e $path || -l $path;
+    # The folders on the way belong to the site owner. Never write through a
+    # symlink, and write as the file's owner, never as root: a folder swapped for
+    # a link to /etc must not turn a restore into a root file write.
+    my $why = _unsafe_parents($path, $uid);
+    return (0, "not restored: $why - restore it by hand after checking the folder") if $why;
     chmod 0600, "$d/file";
-    File::Copy::copy("$d/file", $m{path}) or return (0, "restore failed: $!");
-    chown $m{uid}, $m{gid}, $m{path};
-    chmod oct($m{mode}), $m{path};
-    utime $m{mtime}, $m{mtime}, $m{path};
+    open(my $in, '<', "$d/file") or return (0, "cannot read quarantine entry $id: $!");
+    binmode $in;
+    my $mode = (($m{mode} // '') =~ /^[0-7]{1,4}$/) ? oct($m{mode}) & 0777 : 0644;
+    my $pid = fork();
+    return (0, "restore failed: cannot fork: $!") unless defined $pid;
+    if (!$pid) {
+        if ($> == 0 && $uid != 0) {          # drop to the owner (and its group) for the write
+            $) = "$gid $gid"; $( = $gid; POSIX::setgid($gid);
+            POSIX::setuid($uid);
+            POSIX::_exit(3) unless $> == $uid && $< == $uid;
+        }
+        sysopen(my $out, $path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or POSIX::_exit(4);
+        binmode $out;
+        File::Copy::copy($in, $out) or POSIX::_exit(5);
+        close $out or POSIX::_exit(5);
+        chmod $mode, $path;
+        utime $m{mtime}, $m{mtime}, $path if ($m{mtime} // '') =~ /^\d+$/;
+        POSIX::_exit(0);
+    }
+    waitpid($pid, 0);
+    my $rc = $? >> 8;
+    close $in;
+    return (0, "restore failed (" . ({ 3 => 'cannot switch to the file owner', 4 => 'cannot create the file safely',
+                                      5 => 'write error' }->{$rc} || "code $rc") . ')') if $rc;
     File::Path::remove_tree($d);
-    return (1, "restored $m{path}");
+    return (1, "restored $path");
+}
+
+# _unsafe_parents($path, $uid) -> reason | ''   No folder on the way may be a
+# symlink; for a root-owned file every folder must also be root-owned and not
+# writable by others, since the write then cannot drop privileges.
+sub _unsafe_parents {
+    my ($path, $uid) = @_;
+    my $dir = File::Basename::dirname($path);
+    my @parts = grep { length } split m{/}, $dir;
+    my $cur = '';
+    for my $p (@parts) {
+        $cur .= "/$p";
+        my @st = lstat $cur or return "$cur is missing";
+        return "$cur is a symbolic link" if -l _;
+        return "$cur is not a folder" unless -d _;
+        if ($uid == 0 && $> == 0) {
+            return "$cur is not owned by root" if $st[4] != 0;
+            # world-writable is fine only with the sticky bit (like /tmp):
+            # nobody can then rename or replace an entry they do not own
+            return "$cur is writable by other users" if ($st[2] & 0022) && !($st[2] & 01000);
+        }
+    }
+    return '';
 }
 
 sub quarantine_delete {
@@ -467,7 +541,9 @@ sub act {
             if ($ip && $trust) {
                 %r = (%r, ip => $ip, ip_from => $how, blocked => 0, not_blocked => $trust);
             } elsif ($ip && $block && $s->{engine}) {
-                my ($ok) = $s->{engine}->tempdeny($ip, $ttl, comment => "Scanner: uploaded $h->{file} ($h->{signature})");
+                # the file name is chosen by the uploader: printable, no markup, bounded
+                (my $what = "$h->{file} ($h->{signature})") =~ s/[^\x20-\x7e]|[<>"'&`]/?/g;
+                my ($ok) = $s->{engine}->tempdeny($ip, $ttl, comment => 'Scanner: uploaded ' . substr($what, 0, 200));
                 %r = (%r, ip => $ip, ip_from => $how, blocked => $ok ? 1 : 0);
             } elsif ($ip) {
                 %r = (%r, ip => $ip, ip_from => $how, blocked => 0);

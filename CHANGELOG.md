@@ -2,6 +2,15 @@
 
 All notable changes to CSF - Core Shield Firewall. Dates are release dates (UTC).
 
+## 2.3.2 - 2026-11-06 · Security update - please update
+
+- **Critical: the firewall interface could run a script from an uploaded file name.** The comment the malware scanner writes for a blocked uploader includes the file name, and the allow, deny and temporary lists showed comments without escaping them. A crafted file name could run a script in the administrator's interface (inside WHM on cPanel). Comments are now escaped, and the scanner removes markup from file names before storing them.
+- **High: quarantine restore no longer writes as root.** A restore could follow a folder that the site owner had replaced with a symbolic link and write the file outside the website. A restore now refuses any path through a symbolic link and writes the file as its original owner.
+- **Quarantine never follows a symbolic link** swapped in after the scan, and only removes the file it actually scanned.
+- **The web interface trusts a proxy's visitor address only with a secret key.** Other processes on the server could send a fake address to slip past the sign-in lockout or get another address blocked. The installer creates `/etc/csf/ui.proxykey` and adds it to the nginx sites that proxy to the interface. Sign-in is also paused for everyone after 50 failed attempts in 15 minutes.
+- **File names with line breaks** are no longer scanned (they are reported as suspicious), and scanner results are only accepted for files that were actually scanned.
+- The version now comes from a single `VERSION` file.
+
 ## 2.3.1 - 2026-11-06 · Never lock out the administrator
 
 - **The installer allows your SSH address.** Like legacy ConfigServer CSF, the IP of the SSH session running `install.sh` is added to the allow list, also under `sudo`. Updates run from cron or the web interface have no SSH session and skip this.

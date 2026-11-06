@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://shield.underhost.com/firewall/download/"><img alt="Version" src="https://img.shields.io/badge/version-2.3.1-31E873"></a>
+  <a href="https://shield.underhost.com/firewall/download/"><img alt="Version" src="https://img.shields.io/badge/version-2.3.2-31E873"></a>
   <a href="LICENSE"><img alt="License: GPL v3" src="https://img.shields.io/badge/license-GPL--3.0-4356F9"></a>
   <a href="https://github.com/UnderHost/csf/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/UnderHost/csf/actions/workflows/tests.yml/badge.svg"></a>
   <a href="https://shield.underhost.com/firewall/docs/"><img alt="Documentation" src="https://img.shields.io/badge/docs-shield.underhost.com-363D4D"></a>
@@ -89,12 +89,12 @@ adds any missing core modules and nftables itself). Run as root.
 
 ```sh
 # download + verify the checksum
-curl -fSLO https://shield.underhost.com/firewall/download/csf-2.3.1.tar.gz
-curl -fSLO https://shield.underhost.com/firewall/download/csf-2.3.1.tar.gz.sha256
-sha256sum -c csf-2.3.1.tar.gz.sha256
+curl -fSLO https://shield.underhost.com/firewall/download/csf-2.3.2.tar.gz
+curl -fSLO https://shield.underhost.com/firewall/download/csf-2.3.2.tar.gz.sha256
+sha256sum -c csf-2.3.2.tar.gz.sha256
 
 # install: detects cPanel, CloudPanel or no panel and sets the ports
-tar xzf csf-2.3.1.tar.gz
+tar xzf csf-2.3.2.tar.gz
 cd csf2 && sh install.sh
 ```
 

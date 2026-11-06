@@ -40,6 +40,11 @@ my $PORT  = ($cfg{UI_PORT} && $cfg{UI_PORT} =~ /^\d+$/) ? $cfg{UI_PORT} : 6789;
 my @ALLOW = grep { checkip($_) || CSF2::IP::is_cidr($_) }
             grep { length } map { s/^\s+|\s+$//gr } split /,/, ($cfg{UI_ALLOW} // '');
 my $TRUST_PROXY = (defined $cfg{UI_TRUST_PROXY} && $cfg{UI_TRUST_PROXY} eq '0') ? 0 : 1;
+# Any local process can connect to 127.0.0.1 and send X-Real-IP, so the visitor
+# address from a proxy is only believed when the proxy also sends the secret
+# key from $etc/ui.proxykey (root-only; the installer adds it to nginx sites
+# that proxy to this UI). Without the key every request counts as 127.0.0.1.
+my $PROXY_KEY = do { my $k = ''; if (open my $kf, '<', "$etc/ui.proxykey") { $k = <$kf> // ''; close $kf } $k =~ s/\s+//g; $k };
 my $CGI   = $ENV{CSF2_UI_CGI} || '/usr/local/csf/ui/firewall.cgi';
 my $LOGO  = $ENV{CSF2_UI_LOGO} || '/usr/local/csf/ui/logo.png';
 my $LOG   = $ENV{CSF2_UI_LOG} || '/var/log/csf2-ui.log';
@@ -107,7 +112,8 @@ sub handle {
     # --- client address (behind a local reverse proxy, trust its header) ---
     my $ip = $peer;
     my $local = ($peer eq '127.0.0.1' || $peer eq '::1');
-    if ($local && $TRUST_PROXY) {
+    if ($local && $TRUST_PROXY && length($PROXY_KEY) >= 32
+        && CSF2::UIAuth::ct_eq($PROXY_KEY, $h{'x-csf-proxy-key'} // '')) {
         my $fwd = $h{'x-real-ip'} // ((split /\s*,\s*/, ($h{'x-forwarded-for'} // ''))[-1]);
         $ip = normalize($fwd) if defined $fwd && checkip($fwd);
     }

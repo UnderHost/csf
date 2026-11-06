@@ -1234,7 +1234,7 @@ $notices
       var h='<table class="csfx-tbl"><thead><tr><th>IP / CIDR</th><th>Reason / note</th><th></th></tr></thead><tbody>';
       if(!rows.length){ h+='<tr><td colspan="3" class="csfx-muted">'+(data.length?'No matches.':'None.')+'</td></tr>'; }
       rows.forEach(function(r){
-        h+='<tr><td class="ip">'+esc(r.ip)+'</td><td>'+r.note+'</td><td style="text-align:right">'+
+        h+='<tr><td class="ip">'+esc(r.ip)+'</td><td>'+esc(r.note)+'</td><td style="text-align:right">'+
            '<form method="post" style="margin:0"><input type="hidden" name="tab" value="'+ids.tab+'">'+
            '<input type="hidden" name="ip" value="'+esc(r.ip)+'"><button class="csfx-btn mini" name="action" value="'+act+'">remove</button></form></td></tr>';
       });

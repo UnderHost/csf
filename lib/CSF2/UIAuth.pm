@@ -28,6 +28,8 @@ our $IDLE_SECONDS  = 1800;       # 30 min without a request ends the session
 our $MAX_SECONDS   = 43200;      # 12 h absolute session lifetime
 our $FAIL_LIMIT    = 5;          # failures per IP ...
 our $FAIL_WINDOW   = 900;        # ... within 15 min => locked for the window
+our $FAIL_GLOBAL   = 50;         # failures from all addresses together in the window
+                                 # => sign-in paused for everyone (distributed guessing)
 
 sub new {
     my ($class, %o) = @_;
@@ -281,7 +283,8 @@ sub purge_sessions {
 # per-IP failure throttling: $var/ui-sessions/fail-<ip>  "count first_epoch"
 sub _failfile {
     my ($s, $ip) = @_;
-    (my $k = $ip // 'unknown') =~ s/[^0-9A-Fa-f.:]//g; $k =~ s/:/_/g;
+    my $k = $ip // 'unknown';
+    if ($k ne 'global') { $k =~ s/[^0-9A-Fa-f.:]//g; $k =~ s/:/_/g }
     my $dir = $s->_sdir; mkdir $dir, 0700 unless -d $dir;
     return "$dir/fail-$k";
 }
@@ -293,18 +296,25 @@ sub _failread {
 }
 sub is_locked {
     my ($s, $ip) = @_;
+    my $now = $s->_now;
+    my ($gc, $gt) = $s->_failread('global');
+    return 1 if $now - $gt <= $FAIL_WINDOW && $gc >= $FAIL_GLOBAL;
     my ($c, $t) = $s->_failread($ip);
-    return 0 if $s->_now - $t > $FAIL_WINDOW;
+    return 0 if $now - $t > $FAIL_WINDOW;
     return $c >= $FAIL_LIMIT ? 1 : 0;
 }
 sub record_failure {
     my ($s, $ip) = @_;
-    my ($c, $t) = $s->_failread($ip);
     my $now = $s->_now;
-    ($c, $t) = (0, $now) if $now - $t > $FAIL_WINDOW;
-    $c++;
-    if (open my $fh, '>', $s->_failfile($ip)) { print {$fh} "$c $t\n"; close $fh }
-    return $c;
+    my $mine;
+    for my $k ($ip, 'global') {
+        my ($c, $t) = $s->_failread($k);
+        ($c, $t) = (0, $now) if $now - $t > $FAIL_WINDOW;
+        $c++;
+        if (open my $fh, '>', $s->_failfile($k)) { print {$fh} "$c $t\n"; close $fh }
+        $mine //= $c;
+    }
+    return $mine;
 }
 sub clear_failures { my ($s, $ip) = @_; unlink $s->_failfile($ip) }
 

@@ -150,6 +150,31 @@ is(scalar($sc->quarantine_list), 0, 'entry gone after restore');
 ($ok) = $sc->quarantine_restore('../../etc');
 ok(!$ok, 'invalid id refused');
 
+# --- the site owner controls the folders: no symlink tricks as root ---
+my $can_link = symlink("$R/etc", "$R/linktest") && -l "$R/linktest";
+SKIP: { skip 'symbolic links are not available here', 4 unless $can_link;
+  # a file swapped for a link after the scan is not followed
+  put("$docroot/wp/swap.php", "<?php \$a=1;\n"); unlink "$docroot/wp/swap.php";
+  symlink("$R/etc/userdatadomains", "$docroot/wp/swap.php");
+  my ($qok) = $sc->quarantine({ file => "$docroot/wp/swap.php", engine => 'clamav', signature => 'X', certain => 1 });
+  ok(!$qok, 'quarantine refuses a file that is now a symlink');
+  ok(-e "$R/etc/userdatadomains", 'the link target is untouched');
+  # restore never writes through a folder that became a symlink
+  make_path("$docroot/up");
+  put("$docroot/up/a.php", "<?php \$b=1;\n");
+  my ($q2, $id2) = $sc->quarantine({ file => "$docroot/up/a.php", engine => 'clamav', signature => 'X', certain => 1 });
+  ok($q2, 'quarantined');
+  File::Path::remove_tree("$docroot/up"); make_path("$R/target"); symlink("$R/target", "$docroot/up");
+  my ($rok, $rmsg) = $sc->quarantine_restore($id2);
+  ok(!$rok && !-e "$R/target/a.php", 'restore refuses a folder swapped for a symlink') or diag $rmsg;
+}
+
+# --- engine output about a file we did not list is ignored ---
+{ my $saved = $clam_out; $clam_out = "$R/etc/userdatadomains: Php.Evil FOUND\n";
+  my $h = $sc->scan(["$docroot/index.php"]);
+  is(scalar(grep { $_->{file} eq "$R/etc/userdatadomains" } @$h), 0, 'only listed files can be reported');
+  $clam_out = $saved; }
+
 # alert-only mode never touches files or blocks
 { local $sc->{cfg}{SCAN_ACTION} = 'alert'; local $sc->{cfg}{SCAN_BLOCK_UPLOADER} = 0; @blocked = ();
   my $r2 = $sc->act([{ file => "$docroot/wp/evil.php", engine => 'clamav', signature => 'X', certain => 1 }]);

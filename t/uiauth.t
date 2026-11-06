@@ -65,6 +65,12 @@ is($why, 'locked', 'locked IP cannot log in even with valid credentials');
 $a->{now} = $now + 30 + 901;
 ok(!$a->is_locked('203.0.113.5'), 'lock expires after the window');
 
+# distributed guessing: many addresses, a few tries each -> sign-in paused for all
+for my $i (1 .. $CSF2::UIAuth::FAIL_GLOBAL) { $a->record_failure("198.51.100.$i") }
+ok($a->is_locked('192.0.2.200'), 'global limit pauses sign-in for every address');
+$a->{now} += 901;
+ok(!$a->is_locked('192.0.2.200'), 'global pause expires after the window');
+
 # --- sessions ---
 $a->{now} = 1_900_000_000;
 my $s = $a->create_session('admin');
